@@ -1,0 +1,312 @@
+---
+title: "GSEA"
+output:
+  pdf_document: default
+  html_document: default
+---
+Manual for fgsea:
+http://bioconductor.org/packages/release/bioc/manuals/fgsea/man/fgsea.pdf
+-> Further information on how to create for example enrichment plots
+
+```{r}
+######################
+#######USER INPUT####
+######################
+#Data to import gene list
+FILENAME = "dge_presults.csv"
+FILEPATH = paste("./",FILENAME, sep = "")
+
+#Data to export final files 
+LISTNAME = "presults" #filename to append to saved files
+######################
+######################
+```
+#1. Import required libraries
+```{r}
+# Import required libraries
+library(GSA, quietly=TRUE, warn.conflicts=FALSE, verbose=FALSE)       #To read in gene sets in gmt format
+library(rmarkdown, quietly=TRUE, warn.conflicts=FALSE, verbose=FALSE)
+library(ggdendro,quietly=TRUE,warn.conflicts=FALSE,verbose=FALSE)
+library(dendextend,quietly=TRUE,warn.conflicts=FALSE,verbose=FALSE)
+library(ggplot2, quietly=TRUE, warn.conflicts=FALSE, verbose=FALSE)
+library(colorspace, quietly=TRUE, warn.conflicts=FALSE, verbose=FALSE)
+source("https://bioconductor.org/biocLite.R")
+biocLite("fgsea") #Package that runs GSEA
+biocLite("biomaRt")
+library(biomaRt, quietly=TRUE, warn.conflicts = FALSE, verbose = FALSE)
+setwd("/Users/esidhom/Dropbox (MIT)/Harvard_MD-PhD/GrekaLab/Experiments/Analysis")
+
+# Create mouse and human biomaRts
+human <- useMart(host="www.ensembl.org", "ENSEMBL_MART_ENSEMBL", dataset="hsapiens_gene_ensembl")
+mouse <- useMart(host="www.ensembl.org", "ENSEMBL_MART_ENSEMBL", dataset="mmusculus_gene_ensembl")
+```
+#2. Download gene sets from MSig database in gmt format on your local machine
+#3. Load gene sets in R
+```{r}
+#Example how to load gene sets into R (here: KEGG)
+GOpathways=fgsea::gmtPathways("../GeneSets/c5.bp.v6.2.symbols.gmt")
+KEGGpathways=fgsea::gmtPathways("../GeneSets/c2.cp.kegg.v6.2.symbols.gmt")
+```
+#4. You need a ranked file of your genes of interest. Input is always all genes! Rank them for example by p-value: rank = -log10(pval)*sign(FC)
+```{r}
+#ranklist by -log10(pvalue)*SIGN(log2fc)
+genelist <- read.table(FILEPATH,header = TRUE, sep = " ")
+if (min(genelist$p_val) == 0) {new_min = unique(genelist$Pvalue)[2]/1e10
+genelist$p_val[genelist$p_val == 0] <- new_min}
+ranklist <- data.frame(row.names(genelist),-log(genelist$Pvalue)*sign(genelist$log2FC))
+colnames(ranklist) <- c("geneNames","rank")
+ranklist <- ranklist[order(ranklist$rank, decreasing = TRUE),]
+ranklist <- lapply(ranklist, function(x) if (is.factor(x)) as.character(x) else {x})
+
+#ranklist by zscore
+ranklist2 <- data.frame(row.names(genelist),genelist$Stat)
+colnames(ranklist2) <- c("geneNames","rank")
+ranklist2 <- ranklist2[order(ranklist2$rank, decreasing = TRUE),]
+ranklist2 <- lapply(ranklist2, function(x) if (is.factor(x)) as.character(x) else {x})
+
+#The ranked lists (2 columns: Gene, rank) has to be converted to a named vector (vector for which each entry is assigned to an attribute. Here: The rank-value is assigned to the gene name)
+rnk_file = setNames(ranklist$rank, ranklist$geneNames)
+rnk_file2 = setNames(ranklist2$rank, ranklist2$geneNames)
+```
+#5. Convert mouse to human gene names
+```{r}
+# Get human gene names
+annotation <- getLDS(attributes = c("mgi_symbol"),
+                     filters = "mgi_symbol", values = names(rnk_file2),
+                     mart = mouse,
+                     attributesL = c("hgnc_symbol"), martL = human) 
+
+# Make the rownames of res into a data.frame
+mouseRows <- data.frame(ranklist2$geneNames)
+# Merge mouse and human gene names
+annotationMerged <- merge(x=mouseRows,
+                          y=annotation,
+                          by.x="ranklist2.geneNames",
+                          by.y="MGI.symbol",
+                          all=TRUE)
+# Order mouseRownames to match rownames of dds_2weeks
+## We don't want to remove "NA" here. We need to keep all rows in dds_2weeks
+annotationOrdered <- annotationMerged[match(ranklist2$geneNames, annotationMerged$ranklist2.geneNames),]
+annotationOrdered[is.na(annotationOrdered)] <- "NA"
+# Check if all rownames annotationOrdered equal rownames of dds_2weeks
+all(ranklist2$geneNames == annotationOrdered$ranklist2.geneNames) 
+# Make human gene names a sepamousee data.frame with mouse gene names as row names
+humanGeneNames <- annotationOrdered$HGNC.symbol
+# Add humanGeneNames to dds_2weeks
+rnk_file_hum2 = setNames(ranklist2$rank, humanGeneNames)
+```
+#6. Run GSEA
+-> Output: GSEA statistics with ES, NES, pval, padj,leading edge
+
+```{r}
+#Input: GeneSet, ranked file, number of permutations, minSize of GeneSet, maxSize of GeneSet
+#Output: table of pathways and pdf with enrichment plots
+
+#define GSEA function
+GSEA_run <- function(Pathways,Stats,NAME,LISTNAME){
+  #run GSEA
+  print(paste("Running GSEA: ", NAME, sep=""))
+  GSEA_object = fgsea::fgsea(Pathways,Stats,nperm=10000, minSize=15, maxSize=500, nproc=0, gseaParam=1,BPPARAM=NULL)
+  
+  #only proceed with downstream steps if pathways found
+  if (nrow(GSEA_object) >0) {
+    #make GSEA leading edge column into simple list of genes rather than vectors
+    GSEA_object$leadingEdge <- gsub("[^0-9A-Z ]", "", paste(GSEA_object$leadingEdge))
+    
+    #order table by increasing adjusted p-value and write pathway table to file
+    GSEA_object <- GSEA_object[order(GSEA_object$padj, decreasing = FALSE),]
+    
+    write.table(GSEA_object,file = paste("GSEA/", format(Sys.time(), "%Y%b%d_%H%M"),"_GSEA_", LISTNAME, "_", NAME, ".csv", sep = ""), sep=",", row.names = FALSE)
+    
+    #make pdf of enrichment plots
+    FILENAME <- paste(format(Sys.time(), "%Y%b%d_%H%M"),"_GSEA_", LISTNAME, "_", NAME, ".pdf", sep = "")
+    FILEPATH <- paste("./figures/gsea/",FILENAME,sep="")
+    pdf(file=FILEPATH,useDingbats=FALSE)
+    if (nrow(GSEA_object) <= 50) { for (i in 1:nrow(GSEA_object)) {p <- fgsea::plotEnrichment(Pathways[[GSEA_object$pathway[i]]],Stats) + ggtitle(GSEA_object$pathway[i])
+    print(p)}} else {for (i in 1:50) {p <- fgsea::plotEnrichment(Pathways[[GSEA_object$pathway[i]]],Stats) + ggtitle(GSEA_object$pathway[i])
+    print(p)}}
+    dev.off()
+  } else {print(paste("No ", NAME, " pathways found.", sep=""))}
+  
+  return(GSEA_object)
+}
+
+#run GSEA with different genesets
+GSEA_KEGG <- GSEA_run(KEGGpathways,rnk_file_hum2,"KEGG",LISTNAME)
+#GSEA_GO <- GSEA_run(GOpathways,rnk_file_hum,"GO",LISTNAME)
+
+```
+#7. Leading edge analysis
+
+```{r}
+GSEA_LEanalysis <- function(GSEA_object, geneList, annotation, LISTNAME, NAME, k1, k2,TEXTSIZE){
+  #this function takes in the GSEA output, and file name/path for saving PDF, the name of the pathway database used, and number of clusters to sub-divide dendrograms (k1, k2). It plots up- & down-regulated pathways separately. 
+  
+  #split GSEA object into up- and down-regulated pathways
+  GSEA_object <- GSEA_object[order(GSEA_object$NES, decreasing = TRUE),]
+  GSEA_up <- GSEA_object[which(GSEA_object$NES > 0),]
+  GSEA_down <- GSEA_object[which(GSEA_object$NES < 0),]
+  
+  #perform leading edge analysis on each set separately
+  DIRECTION="UP in CTRL"
+  FILENAME <- paste(format(Sys.time(), "%Y%b%d_%H%M"),"_LEAnalysis_", LISTNAME, "_", NAME, "_", gsub("[^A-z]","",DIRECTION), ".pdf", sep = "")
+  FILEPATH <- paste("figures/gsea/",FILENAME,sep="")
+  pdf(file=FILEPATH,useDingbats=FALSE)
+  GSEA_LE(GSEA_split=GSEA_up, geneList=geneList, annotation=annotation, LISTNAME=LISTNAME, NAME=NAME, DIRECTION=DIRECTION, k=k1, TEXTSIZE=TEXTSIZE)
+  dev.off()
+  
+  DIRECTION="UP in KDKD"
+  FILENAME <- paste(format(Sys.time(), "%Y%b%d_%H%M"),"_LEAnalysis_", LISTNAME, "_", NAME, "_", gsub("[^A-z]","",DIRECTION), ".pdf", sep = "")
+  FILEPATH <- paste("figures/gsea/",FILENAME,sep="")
+  pdf(file=FILEPATH,useDingbats=FALSE)
+  GSEA_LE(GSEA_split=GSEA_down, geneList=geneList, annotation=annotation, LISTNAME=LISTNAME, NAME=NAME, DIRECTION=DIRECTION, k=k2, TEXTSIZE=TEXTSIZE)
+  dev.off()
+}
+GSEA_LE <- function(GSEA_split, geneList, annotation, LISTNAME, NAME, DIRECTION, k, TEXTSIZE){
+  
+  #if pathway list is >100 pathways, select the top 100 by adj. p-value for efficiency 
+  if (nrow(GSEA_split) > 100) {
+    GSEA_split <- GSEA_split[order(GSEA_split$padj, decreasing = FALSE),]
+    GSEA_split <- GSEA_split[1:100,]
+  }
+  #create a list holding all leading edge genes for each pathway
+  GeneList = list()
+  for (i in 1:nrow(GSEA_split)) {
+    GeneList[i] <- as.list(strsplit(GSEA_split$leadingEdge[i],"[[:space:]]"))
+  }
+  names(GeneList) <- GSEA_split$pathway
+  
+  #create distance matrix of overlap between all genes
+  #Overlap = #intersection(A,B)/max(size(A), size(B))
+  Overlap.matrix <- matrix(0L, nrow = nrow(GSEA_split), ncol = nrow(GSEA_split))
+  for (i in 1:nrow(GSEA_split)) {
+    for (j in 1:nrow(GSEA_split)) {
+      Intersection = length(intersect(GeneList[i][[GSEA_split$pathway[i]]], GeneList[j][[GSEA_split$pathway[j]]]))
+      Size = max(c(length(GeneList[i][[GSEA_split$pathway[i]]]), length(GeneList[j][[GSEA_split$pathway[j]]])))
+      Overlap.matrix[i,j] <- Intersection/Size
+    }
+  }
+  
+  #calculate distance matrix and make dendrogram. Divide dendrogram in k clusters and plot each separately.
+  Overlap.matrix <- data.frame(Overlap.matrix) #convert overlap matrix to a data frame
+  rownames(Overlap.matrix) <- GSEA_split$pathway #label rows with pathways
+  hc <- hclust(dist(Overlap.matrix, method = "euclidean"), method = "average") #calculate distance matrix
+  dend <- as.dendrogram(hc) #convert to dendrogram
+  
+  cols <- rainbow_hcl(k) #select colors for clusters
+  dend <- dend %>% color_branches(k = k, col = cols) %>% 
+    set("branches_lwd", 0.5)
+  clust    <- cutree(dend,k=k) #cluster dendrogram based on k-means
+  clust.df <- data.frame(label=names(clust), cluster=factor(clust)) #create data-frame with pathways & cluster assignments) 
+  
+  ggd1 <- as.ggdend(dend) #convert to ggplot2 structure 
+  
+  #plot full dendrogram
+  print(ggplot(ggd1, labels = FALSE) + 
+          ggtitle(paste(NAME, " - ", DIRECTION, sep=""))+
+          coord_flip() + 
+          scale_x_continuous(breaks = label(ggd1)$x, 
+                             labels = label(ggd1)$label,
+                             position = "top") +
+          scale_y_reverse(expand = c(0, 0)) +
+          theme_minimal() + 
+          theme(axis.title = element_blank(),
+                axis.text.y = element_text(size = rel(TEXTSIZE)),
+                panel.grid = element_blank()))
+  
+  
+  #prune original dendrogram into smaller dendrograms
+  dends <- list()
+  for(i in 1:k) {
+    labels_to_prune <- clust.df$label[which(clust.df$cluster != i)]
+    dends[[i]] <- prune(dend, labels_to_prune)
+  }
+  
+  #plot dendrograms of individual clusters and display most highly represented genes
+  for(i in 1:k) {
+    Clust.labels <- clust.df$label[which(clust.df$cluster == i)]
+    if (length(Clust.labels) > 1) {
+      temp <- as.ggdend(dends[[i]])
+      
+      print(ggplot(temp, labels = FALSE) + 
+              ggtitle(paste0("TREE ", i)) +
+              coord_flip() + 
+              scale_x_continuous(breaks = label(temp)$x, 
+                                 labels = label(temp)$label,
+                                 position = "top") +
+              scale_y_reverse(expand = c(0, 0)) +
+              theme_minimal() + 
+              theme(axis.title = element_blank(),
+                    axis.text.y = element_text(size = rel(TEXTSIZE)),
+                    panel.grid = element_blank()))
+      
+      Merge.genes = list()
+      for (j in 1:length(Clust.labels)) {
+        temp_label <- as.character(Clust.labels[j])
+        temp_index <- which(clust.df$label == temp_label)
+        Merge.genes = c(Merge.genes,GeneList[temp_index][[temp_label]])
+      }
+      Merge.genes <- as.character(Merge.genes)
+      Unique.genes <- unique(Merge.genes)
+      Count.vector <- matrix(0L, nrow = length(Unique.genes), ncol = 1)
+      for (j in 1:length(Unique.genes)) {
+        temp_gene <- Unique.genes[j]
+        Count.vector[j] <- length(which(Merge.genes == temp_gene))
+      }
+      
+      Count.vector <- data.frame(Count.vector,Unique.genes, stringsAsFactors = FALSE)
+      Count.vector <- Count.vector[order(Count.vector$Unique.genes),]
+      rownames(Count.vector) <- Count.vector$Unique.genes
+      Count.vector$Unique.genes <- NULL
+      colnames(Count.vector) <- "Count"
+      
+      annotation$HGNC.symbol <- gsub("[^0-9A-Z ]","",annotation$HGNC.symbol)
+      
+      mouse.genes <- annotation[is.element(annotation$HGNC.symbol,Unique.genes),]
+      mouse.genes$ranklist2.geneNames <- as.character(mouse.genes$ranklist2.geneNames)
+      
+      if (dim(mouse.genes)[1] > dim(Count.vector)[1]) {
+        print("Found duplicate genes")
+        countgenes <- as.data.frame(table(mouse.genes$HGNC.symbol))
+        multiplegenes <- countgenes$Var1[countgenes$Freq > 1]
+        for (m in 1:length(multiplegenes)){
+          temp.gene <- multiplegenes[m]
+          print(temp.gene)
+          temp.msgenes <- which(mouse.genes$HGNC.symbol == temp.gene)
+          print(mouse.genes$ranklist2.geneNames[temp.msgenes])
+          mouse.genes <- mouse.genes[-temp.msgenes[2:length(temp.msgenes)],]
+        }
+      }
+      rownames(mouse.genes) <- mouse.genes$HGNC.symbol
+      mouse.genes$HGNC.symbol <- NULL
+      colnames(mouse.genes) <- "Gene"
+      
+      Gene.counts <- as.data.frame(geneList[is.element(rownames(geneList),mouse.genes$Gene),])
+      Gene.counts$pct.1 <- NULL
+      Gene.counts$pct.2 <- NULL
+      
+      Gene.counts <- cbind(mouse.genes,Gene.counts)
+      Gene.counts <- Gene.counts[order(rownames(Gene.counts)),]
+      Gene.counts <- cbind(Gene.counts,Count.vector)
+      
+      Gene.counts <- Gene.counts[order(Gene.counts$Pvalue),]
+      Gene.counts <- Gene.counts[order(Gene.counts$Count, decreasing = T),]
+      
+      FILENAME <- paste(format(Sys.time(), "%Y%b%d_%H%M"),"_LEAnalysisGeneList_", LISTNAME, "_", NAME, "_", gsub("[^A-z]","",DIRECTION),"_Cluster#_", i, ".csv", sep = "")
+      FILEPATH <- paste("GSEA/",FILENAME,sep="")
+      write.table(Gene.counts, file=FILEPATH, sep=",",row.names = TRUE)
+      
+      print(paste(NAME, "pathways, ", DIRECTION, ", Cluster #", i, " - most significant genes:", sep="" ))
+      print.data.frame(Gene.counts[1:10,])
+    }
+    
+  }
+  
+}
+
+GSEA_LEanalysis(GSEA_KEGG, genelist, annotationOrdered, LISTNAME, NAME="KEGG", k1=3, k2=3,TEXTSIZE=1)
+#GSEA_LEanalysis(GSEA_GO, genelist, annotation,Ordered, LISTNAME, NAME="GO", k1=3, k2=3,TEXTSIZE=0.8)
+
+```
+
+
